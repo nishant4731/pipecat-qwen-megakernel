@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pipecat-qwen-megakernel"
+version = "0.1.0"
+description = "Megakernel-backed Qwen3-TTS for Pipecat voice agents (RTX 5090)"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = []  # see requirements.txt — installed by scripts/setup.sh
+
+[tool.setuptools]
+packages = ["patches", "pipecat_qwen_megakernel"]

@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.DS_Store
+
+# Cloned reference repos — vendored locally for source reading, not shipped.
+refs/
+
+# Patched megakernel build artifacts.
+third_party/
+*.cu.o
+*.so
+
+# Local model caches.
+.cache/
+~/.cache/huggingface/
+
+# Bench outputs / recordings.
+*.wav
+*.mp4
+bench-output/
+
+# Internal working notes — Vast.ai setup screenshots, Playwright captures,
+# Claude session state. Not part of the deliverable.
+.claude/
+.playwright-mcp/
+snap-*.md
+vast-*.png

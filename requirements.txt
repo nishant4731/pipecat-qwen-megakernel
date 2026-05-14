@@ -1,0 +1,25 @@
+# Runtime deps for the megakernel-backed Qwen3-TTS Pipecat demo.
+# Run scripts/setup.sh on a fresh RTX 5090 instance — it installs torch
+# nightly (cu128) separately because of the sm_120 build requirement.
+
+# Pipecat with the extras we actually use. The smallwebrtc extra ships the
+# self-hosted WebRTC server + static client.
+pipecat-ai[silero,webrtc,whisper]>=0.0.104
+
+# HF inference for Qwen3-TTS / Qwen3-Instruct.
+transformers>=4.46
+accelerate
+safetensors
+
+# Audio.
+numpy
+soundfile
+
+# Streaming UX / observability.
+loguru
+
+# faster-whisper backend used by Pipecat's WhisperSTTService.
+faster-whisper>=1.0.3
+
+# CLI ergonomics.
+python-dotenv
