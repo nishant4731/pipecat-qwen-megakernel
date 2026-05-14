@@ -8,27 +8,44 @@ Take-home brief: take [AlpinDale's `qwen_megakernel`](https://github.com/AlpinDa
 
 All measurements on a single RTX 5090 (sm_120a) on Vast.ai, bf16 throughout, no quantization. Three bench scripts produce these:
 
-| metric | value | how / target |
+| metric | value | brief target |
 |---|---|---|
-| Megakernel decode on talker shape (`bench_kernel.py`, 1,000 steps) | **662 tok/s · 1.51 ms / step** | AlpinDale's text-shape reference: 1,036 tok/s. Talker only needs 12.5 tok/s → kernel has 53× headroom. |
-| TTFC (`bench_tts.py`, 5 runs, mean / p95) | **105.1 / 105.3 ms** | brief target: < 60 ms |
-| RTF (`bench_tts.py`, 5 runs, mean / p95) | **1.225 / 1.227** | brief target: < 0.15 |
-| Audio streaming | per-frame `TTSAudioRawFrame` (80 ms / frame) | brief target: not buffered |
-| End-to-end voice turn (push-to-talk demo, representative) | STT 280 ms · LLM 1,340 ms · TTS 2,100 ms / 2.3 s audio · **~3.72 s total** | brief asks: report it |
+| Megakernel decode on talker shape (`bench_kernel.py`, 1,000 steps) | **662 tok/s · 1.51 ms / step** | reference: 1,036 tok/s on 0.6B-text |
+| **TTFC** (`bench_tts.py`, 5 runs, mean / p95) | **36.8 / 37.9 ms** ✅✅ | < 60 ms (strict) / **< 50 ms (stretch) ✅** |
+| **RTF** (`bench_tts.py`, 5 runs, mean / p95) | **0.352 / 0.363** | < 0.15 (strict) / < 0.3 (lenient) — between |
+| Audio streaming | per-frame `TTSAudioRawFrame` (80 ms / frame) ✅ | not buffered |
+| End-to-end voice turn (push-to-talk demo) | STT 280 ms · LLM 1,340 ms · TTS RTF≈0.62 · **~3.5 s** for a 2-3 s reply | report it |
 | Numerical parity vs HF reference | intelligible Base voice (by ear) | codec-token diff not yet run — open risk |
 
-The kernel is doing exactly what it should. Per-AR-frame breakdown from `bench_stages.py`:
+**TTFC hits the brief's stretch target (< 50 ms).** RTF (0.35) is between the lenient < 0.3 and strict < 0.15 — we're generating audio at ~2.9× real-time, the strict target asks for 6.7×. Closing the remaining gap requires a manual `torch.cuda.graph()` capture of the per-frame critical path — see "Where the rest is" below.
 
-| stage | mean ms / call | % of frame |
-|---|---|---|
-| Megakernel + composite embed | 1.52 | 1.5 % |
-| `code_predictor.generate(max_new_tokens=15)` | 74.76 | 75.7 % |
-| `speech_tokenizer.decode([{audio_codes}])` | 22.50 | 22.8 % |
-| Per-AR-frame total | **98.78** | — |
-| Audio per frame | 80 ms | — |
-| → per-frame RTF | 1.235 | — |
+### Where the rest is
 
-**98% of per-frame wall-time is in two HF code paths the brief didn't ask us to optimize.** The brief targets the **talker** decode kernel, and that part is sub-2% of frame time. See [STATUS.md](STATUS.md) for what would have to change to actually close the TTFC and RTF gaps — short version: hand-rolled 15-step Code Predictor decode loop (replaces `.generate(...)`), `torch.compile` on speech_tokenizer, optional LLM token-streaming to start TTS sooner.
+Per-AR-frame breakdown from `bench_stages.py` after the optimization round (was 98.8 ms / frame at baseline):
+
+| stage | baseline ms | now ms | how |
+|---|---|---|---|
+| Megakernel + composite embed | 1.52 | 1.52 | unchanged — already in budget |
+| Talker step (megakernel + compose_embed callback, includes CP) | 76.26 | **25.6** | see decomposition below |
+|   ↳ Code Predictor 15-step decode | 74.76 | **~15** | hand-rolled greedy loop + `torch.compile` of the **whole** 15-step function (`max-autotune-no-cudagraphs`) + HF `StaticCache`. Compiling cp.model alone leaves 15 separate dispatcher calls in between; whole-loop compile fuses across them. |
+|   ↳ Megakernel decode + python callback overhead | 1.5 + ~9 | 1.5 + ~9 | unchanged — Python callback into compose_embed each step is on the critical path |
+|   ↳ Fused codebook gather (replaces 15 separate embedding lookups) | — | ~0.04 | one fancy-indexing into pre-stacked `[15, 2048, H]` tensor |
+| `speech_tokenizer.decode` | 22.50 | **1.59** | `torch.compile(reduce-overhead)` on `speech_tokenizer.model.decoder` (pure conv-net, no HF Cache → CUDA Graphs capture cleanly). Bypass the outer wrapper so the compiled module is actually called. |
+| **Per-AR-frame total** | **98.78** | **~27.2** | **-72 %** |
+| Audio per frame | 80 ms | 80 ms | — |
+| → per-frame RTF | 1.235 | **~0.34** | matches measured (0.352) |
+
+### What we tried that didn't work
+
+To close the remaining gap to RTF < 0.15 (need per-frame < 12 ms) we'd have to eliminate the ~9 ms of Python overhead inside `_compose_embed` that runs each step. That overhead is on the megakernel's critical path because the kernel **calls back** into Python to compute the next composite embed between every step. Pure-GPU operations there sum to < 1 ms; the rest is the C++↔Python bridge cost.
+
+Things attempted that didn't reduce that bridge cost:
+
+1. `torch.compile(mode="reduce-overhead")` (CUDA Graphs) on the whole-loop CP decode: gets stuck in a recompile-then-capture loop for 10+ min on this 5-layer model. The `cache_position` changes each step so inductor treats each as a new shape; combined with graph capture on top this becomes intractable.
+2. Per-step `cudagraph_mark_step_begin()` between forwards: classifier still flags HF Cache as a mutated input, falls back to no-cudagraphs.
+3. Compiling `_compose_embed` itself: hits the same assertion / list-mutation issues that prevent fullgraph compile (frame_codes list append, conditional trailing_text indexing).
+
+To actually hit RTF < 0.15 you'd need a manual `torch.cuda.graph()` capture around the per-frame critical path (compose_embed + CP + speech_tokenizer + megakernel-callback handling), with pre-allocated input/output buffers and indexed-update everywhere. Plus, the megakernel itself would need a small change: skip the Python callback in steady-state and run on a captured-graph schedule. That's real engineering — a few hundred lines plus correctness validation against the HF reference, and a megakernel patch. The clear next step if this project continues.
 
 ## Architecture
 

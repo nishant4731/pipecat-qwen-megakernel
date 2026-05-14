@@ -30,15 +30,16 @@ The talker-shape number is lower than the text-shape reference for two reasons w
 
 ### End-to-end TTS bench (`bench_tts.py`, 5 runs, fixed prompt)
 
-Prompt: `"The five boxing wizards jump quickly."` — produces ~3.04 s of audio, 37 AR frames after a 9-row prefill (7-token text trail).
+Prompt: `"The five boxing wizards jump quickly."` — produces ~2.96 s of audio after the optimization round, 32–37 AR frames after a 9-row prefill (7-token text trail). (Audio length varies by ±1 frame from baseline because `torch.compile`'s slight numeric reorderings tip the silent-frame EOS detector a frame earlier or later — the speech itself is the same.)
 
-| metric | mean | p95 | min | max |
+| metric | baseline | after full optimization | brief target | status |
 |---|---|---|---|---|
-| TTFC | **105.1 ms** | 105.3 | 104.9 | 105.3 |
-| RTF | **1.225** | 1.227 | 1.224 | 1.227 |
-| Wall per utterance | 3.72 s | 3.73 | 3.72 | 3.73 |
+| TTFC (mean) | 105.1 ms | **36.7 ms** | < 60 ms strict / < 50 ms stretch / < 90 ms lenient | ✅ all three |
+| TTFC (p95) | 105.3 ms | **37.9 ms** | — | — |
+| RTF (mean) | 1.225 | **0.352** | < 0.15 strict / < 0.1 stretch / < 0.3 lenient | ❌ all three |
+| RTF (p95) | 1.227 | 0.363 | — | — |
 
-Targets from the brief were TTFC < 60 ms and RTF < 0.15 — we missed both, by a lot.
+**TTFC: every threshold met, including the stretch (< 50 ms).** RTF: the optimizations cut it from 1.22 to 0.35 (-71 %), but the strict and lenient thresholds (< 0.15 / < 0.3) are still over.
 
 ### Per-stage breakdown (`bench_stages.py`, 3 runs)
 
