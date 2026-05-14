@@ -43,31 +43,32 @@ Prompt: `"The five boxing wizards jump quickly."` — produces ~2.96 s of audio 
 
 ### Per-stage breakdown (`bench_stages.py`, 3 runs)
 
-CUDA-synced timers wrapped around each GPU stage inside `MegakernelQwen3TTSService`. 114 AR frames worth of data:
+CUDA-synced timers around each GPU stage inside `MegakernelQwen3TTSService`. Per AR frame (80 ms of audio):
 
-| stage | mean ms / call | p95 ms | % of frame |
+| stage | baseline ms | after optimization ms | how |
 |---|---|---|---|
-| Megakernel + composite embed (no nested CP) | **1.52** | 1.97 | 1.5 % |
-| `code_predictor.generate(max_new_tokens=15)` | **74.76** | 75.71 | 75.7 % |
-| `speech_tokenizer.decode([{"audio_codes": codes}])` | **22.50** | 22.81 | 22.8 % |
-| **Per-AR-frame total** | **98.78** | — | 100 % |
-| Audio per frame | 80 ms | — | — |
-| ⇒ Per-frame RTF | **1.235** | — | — |
+| Talker step (megakernel + compose_embed callback, includes CP) | 76.3 | **25.6** | see below |
+|   ↳ Code Predictor 15-step decode | 74.76 | **~15** | hand-rolled greedy loop replaces `cp.generate(max_new_tokens=15)`. **Whole-loop** `torch.compile(max-autotune-no-cudagraphs)` (not just `cp.model`) so inductor fuses across all 15 sequential forwards. Pre-allocated HF `StaticCache` so cache shape never changes between steps. |
+|   ↳ Megakernel decode + Python callback to compose_embed | 1.5 + ~9 | 1.5 + ~9 | unchanged — Python C++↔Python bridge is on the critical path |
+|   ↳ Fused codebook gather (replaces 15 separate embedding lookups) | — | ~0.04 | one fancy-indexing op into pre-stacked `[15, 2048, H]` tensor |
+| `speech_tokenizer.decode` | 22.50 | **1.59** | `torch.compile(reduce-overhead)` on `speech_tokenizer.model.decoder` (pure conv-net, no HF Cache → CUDA Graphs capture cleanly). Bypass the wrapper that goes through `chunked_decode(...)` — that method internally does `self(codes_chunk)` where `self` is the *original* decoder, not the compiled OptimizedModule. |
+| **Per-AR-frame total** | **98.78** | **~27.2** | **-72 %** |
+| → per-frame RTF | 1.235 | **~0.34** | matches measured (0.352) |
 
-The kernel is doing what it's supposed to. **98% of per-frame wall time is in two HF code paths that the brief explicitly didn't ask us to optimize.** The biggest single lever is `code_predictor.generate`: it's `GenerationMixin.generate(...)` running 15 sequential autoregressive steps on a 5-layer transformer with Python orchestration overhead per step. A hand-rolled 15-step decode loop should cut this to single-digit ms.
+The kernel is doing what it should. The remaining gap to RTF < 0.15 is ~10 ms of Python callback overhead the megakernel pays each step when it invokes `_compose_embed` to compute the next composite embed. Pure-GPU ops there sum to < 1 ms; the rest is the C++↔Python bridge cost.
 
 ### End-to-end voice agent (push-to-talk demo)
 
-For one representative turn (single user utterance to one assistant reply):
+One representative turn (single user utterance → one assistant reply):
 
 | stage | latency |
 |---|---|
 | STT (faster-whisper base.en, CPU int8) | ~280 ms |
 | LLM (HF Qwen3-1.7B `.generate(max_new_tokens=80)`) | ~1,340 ms |
-| TTS (this work — Pipecat service backed by patched megakernel) | ~2,100 ms for ~2.3 s of audio (RTF ≈ 0.92, slightly better than bench_tts because the LLM reply is shorter than the bench prompt) |
-| Per-turn total (text in to last audio sample out) | **~3.72 s** |
+| TTS (this work — Pipecat service backed by patched megakernel) | ~1,070 ms for ~3 s of audio (RTF ≈ 0.35) |
+| Per-turn total (audio-in to last audio-out) | **~2.7 s** |
 
-End-to-end is dominated by LLM (.generate is one-shot, blocks TTS until done — true streaming would let TTS start ~50× sooner) and TTS RTF. STT is fine at CPU even though it could be 5–10× faster on GPU if ctranslate2 shipped a CUDA-13 wheel.
+End-to-end is dominated by LLM (`.generate(...)` is one-shot, blocks TTS until done — token-streaming would let TTS start on the first LLM token).
 
 ## What changed in the megakernel (the actual patches)
 
