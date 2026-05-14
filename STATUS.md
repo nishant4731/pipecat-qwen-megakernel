@@ -14,16 +14,18 @@ The push-to-talk demo path (laptop client over SSH to bot on Vast.ai 5090):
 
 Audio is intelligible speech in the default Qwen3-TTS Base voice.
 
-## Measured numbers (single RTX 5090 sm_120a)
+## Measured numbers (single RTX 5090 sm_120a, Vast.ai)
 
-| metric | value |
-|---|---|
-| Megakernel talker decode | ~1 ms / step (matches AlpinDale's 0.6B-text figure, expected — only the LM head shrunk) |
-| TTFC | **79 ms** |
-| RTF | **0.89** |
-| Per-utterance turn (example) | STT ~280 ms · LLM ~1340 ms · TTS 2.10 s @ RTF 0.89 · total ~3720 ms |
+Methodology: `python -m pipecat_qwen_megakernel.bench.bench_tts --runs 5 --text "The five boxing wizards jump quickly."` (audio = 3.04 s / utterance, AR_steps = 37, prefill rows = 9, text trail = 7). Mean / p95 / min / max over 5 runs:
 
-Targets from the brief were TTFC < 60 ms and RTF < 0.15 — we missed both. The megakernel is well inside budget. The dominant per-frame costs are upstream-side: `code_predictor.generate(max_new_tokens=15, ...)` per talker frame (Python `.generate()` overhead) and `speech_tokenizer.decode([{"audio_codes": codes}])` for a single-frame slice. See "Where the budget went" below.
+| metric | mean | p95 | min | max |
+|---|---|---|---|---|
+| Megakernel talker decode | ~1 ms / step | — | — | — |
+| TTFC | **105.1 ms** | 105.3 | 104.9 | 105.3 |
+| RTF | **1.225** | 1.227 | 1.224 | 1.227 |
+| Wall per utterance | 3.72 s | 3.73 | 3.72 | 3.73 |
+
+Targets from the brief were TTFC < 60 ms and RTF < 0.15 — we missed both, by a lot. The megakernel itself is well inside budget. The dominant per-frame costs are upstream-side: `code_predictor.generate(max_new_tokens=15, ...)` per talker frame (Python `.generate()` overhead) and `speech_tokenizer.decode([{"audio_codes": codes}])` for a single-frame slice. Each full AR step costs **~98 ms wall** for 80 ms of audio → RTF > 1. See "Where the budget went" below.
 
 ## What changed in the megakernel (the actual patches)
 

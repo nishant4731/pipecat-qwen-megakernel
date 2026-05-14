@@ -6,15 +6,17 @@ Take-home brief: take [AlpinDale's `qwen_megakernel`](https://github.com/AlpinDa
 
 ## TL;DR
 
-| metric                                 | result            | target  |
-|----------------------------------------|-------------------|---------|
-| Megakernel talker decode (per step)    | **~1 ms**         | n/a     |
-| TTFC (text → first audio chunk)        | **79 ms**         | < 60 ms |
-| RTF (wall-time / audio-seconds)        | **0.89**          | < 0.15  |
-| Audio streaming                        | per-frame, 80 ms  | yes     |
-| Numerical parity vs HF reference       | ✅ intelligible    | ✅       |
+5-run `bench_tts.py` on a single RTX 5090 (sm_120a) on Vast.ai, fixed prompt *"The five boxing wizards jump quickly."* (~3.04 s of audio per utterance):
 
-The TTFC/RTF numbers come from `bench_tts.py` on a single RTX 5090 (sm_120a) on Vast.ai. We **did not** hit the < 60 ms / < 0.15 stretch targets — the megakernel itself is in budget (~1 ms / step), but two things outside the kernel dominate end-to-end time: HF `code_predictor.generate(...)` (15 residual codebooks per frame, Python overhead) and the speech-tokenizer vocoder. See [STATUS.md](STATUS.md) for the breakdown and what would have to change to close the gap.
+| metric                                 | mean      | p95       | target  |
+|----------------------------------------|-----------|-----------|---------|
+| Megakernel talker decode (per step)    | ~1 ms     | —         | n/a     |
+| TTFC (text → first audio chunk)        | **105 ms**| 105 ms    | < 60 ms |
+| RTF (wall-time / audio-seconds)        | **1.22**  | 1.23      | < 0.15  |
+| Audio streaming                        | per-frame (80 ms) | — | yes     |
+| Numerical parity vs HF reference       | ✅ intelligible    | — | ✅       |
+
+We **missed both** of the brief's stretch targets, by a lot. The megakernel itself is well inside budget at ~1 ms / step. The dominant per-frame costs are upstream and Python-side: HF `code_predictor.generate(max_new_tokens=15, ...)` per talker frame and `speech_tokenizer.decode([{"audio_codes": codes}])` called once per single-frame slice. With these as-is, each AR step costs ~98 ms wall vs the 80 ms of audio it produces — that's where RTF > 1 comes from. See [STATUS.md](STATUS.md) for the per-stage breakdown and what would have to change to close the gap.
 
 ## Architecture
 
@@ -146,7 +148,7 @@ The push-to-talk path exercises the **same** STT → LLM → megakernel-TTS pipe
 ## Honest notes
 
 - **Whisper STT currently runs on CPU.** The Vast.ai image we used ships CUDA 13; ctranslate2 (faster-whisper's backend) has no CUDA-13 wheel yet, so `device="cuda"` fails with `libcublas.so.12 not found`. `base.en` on CPU int8 takes ~200–400 ms per short utterance — fine for an interactive demo. CUDA-12 deps (`nvidia-cublas-cu12`, `nvidia-cudnn-cu12`) installed via pip would restore GPU inference.
-- **TTFC is 79 ms, RTF is 0.89** — we missed the < 60 ms / < 0.15 stretch targets. The megakernel itself is well inside budget (~1 ms / step). The dominant per-frame costs are HF `code_predictor.generate(max_new_tokens=15)` and `speech_tokenizer.decode` for one 80 ms frame — both Python-side, both un-tuned. STATUS.md has the per-stage breakdown and what we'd change to close the gap (manual Code-Predictor decode loop, `torch.compile`, or batching multiple talker frames per vocoder call).
+- **TTFC is 105 ms, RTF is 1.22** (mean, n=5, single 5090) — we missed the < 60 ms / < 0.15 stretch targets by a wide margin. The megakernel itself is well inside budget (~1 ms / step). The dominant per-frame costs are HF `code_predictor.generate(max_new_tokens=15)` and `speech_tokenizer.decode` for one 80 ms frame — both Python-side, both un-tuned. Each full AR step costs ~98 ms wall, which is why RTF > 1. STATUS.md has the per-stage breakdown and what would close the gap (manual Code-Predictor decode loop instead of `.generate(...)`, `torch.compile`, batching multiple talker frames per vocoder call).
 - The **correctness gate (codec-token diff vs stock HF Qwen3-TTS)** was not exhaustively run as a regression — we instead validated by ear (audio is recognizable speech using the default Base voice) plus matching dimensions and special-token IDs against `modeling_qwen3_tts.py`. A proper element-wise codec-token diff is the next thing to add if you're investing further.
 
 ## Why we didn't try to also accelerate Code Predictor / vocoder
