@@ -155,14 +155,16 @@ class MegakernelQwen3TTSService(TTSService):
 
         # The vocoder (speech_tokenizer.model.decoder) is a causal ConvNet that
         # runs once per AR frame with stable single-frame input shape [1, 16, 1].
-        # Compile the inner decoder forward — the outer ``decode()`` wrapper does
-        # input prep we can't easily compile.
+        # It has NO HF Cache (pure conv), so ``mode="reduce-overhead"`` is safe
+        # here — CUDA Graphs cut the decode call from ~20 ms to ~1 ms.
+        # The caller must wrap each invocation with cudagraph_mark_step_begin()
+        # (handled in _decode_frame_to_audio).
         try:
             self._speech_tokenizer.model.decoder = torch.compile(
                 self._speech_tokenizer.model.decoder,
-                mode="default", dynamic=False, fullgraph=False,
+                mode="reduce-overhead", dynamic=False, fullgraph=False,
             )
-            logger.info("torch.compile applied to speech_tokenizer.model.decoder")
+            logger.info("torch.compile(reduce-overhead) applied to speech_tokenizer.model.decoder")
         except Exception as e:
             logger.warning(f"torch.compile on speech_tokenizer.model.decoder failed: {e}")
         if self._speech_tokenizer is None:
@@ -561,21 +563,27 @@ class MegakernelQwen3TTSService(TTSService):
             self._utt = None
 
     def _decode_frame_to_audio(self, frame_codes: torch.Tensor) -> bytes:
-        """Run ``speech_tokenizer.decode`` for one talker frame.
+        """Run the speech_tokenizer decoder for one talker frame.
 
-        ``frame_codes`` shape: ``[1, 16]`` long (T=1, Q=16). The decoder's
-        wrapper (``Qwen3TTSTokenizer.decode`` in qwen_tts) then pads the
-        single-element list into ``[B=1, T=1, Q=16]`` and feeds that to
-        ``Qwen3TTSTokenizerV2Model.decode`` which expects
-        ``(batch_size, codes_length, num_quantizers)``.
+        ``frame_codes`` shape: ``[1, 16]`` long (T=1, Q=16).
+
+        We bypass ``speech_tokenizer.decode([{audio_codes: ...}])`` because that
+        wrapper goes through ``decoder.chunked_decode(...)`` which internally
+        calls ``self(codes_chunk)`` — and ``self`` there is the ORIGINAL decoder
+        instance, so the compiled wrapper we installed at ``decoder`` never gets
+        hit. Calling ``self._speech_tokenizer.model.decoder(...)`` directly
+        respects the compile and saves ~20 ms per call (CUDA-Graph-captured
+        path: ~1 ms vs ~20 ms eager).
         """
-        codes_for_decoder = frame_codes.view(1, CODEBOOKS_PER_FRAME)  # (T=1, Q=16)
-        wavs, sr = self._speech_tokenizer.decode([{"audio_codes": codes_for_decoder}])
-        if sr != SAMPLE_RATE:
-            raise RuntimeError(f"speech_tokenizer returned sr={sr}, expected {SAMPLE_RATE}")
-        wav = wavs[0]  # numpy float array, mono
-        if isinstance(wav, torch.Tensor):
-            wav = wav.detach().cpu().numpy()
+        # codes shape that the decoder.forward expects: (B, Q, T) = (1, 16, 1)
+        codes_btq = frame_codes.view(1, 1, CODEBOOKS_PER_FRAME)
+        codes_bqt = codes_btq.transpose(1, 2)  # (1, 16, 1)
+
+        # Mark CUDA-Graph step boundary so previous frame's captured outputs
+        # are recycled cleanly before the next replay.
+        torch.compiler.cudagraph_mark_step_begin()
+        out = self._speech_tokenizer.model.decoder(codes_bqt)  # (1, 1, samples)
+        wav = out.squeeze().to(torch.float32).detach().cpu().numpy()
         wav = np.clip(wav, -1.0, 1.0)
         audio_int16 = (wav * 32767.0).astype(np.int16)
         return audio_int16.tobytes()
