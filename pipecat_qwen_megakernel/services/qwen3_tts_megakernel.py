@@ -134,26 +134,35 @@ class MegakernelQwen3TTSService(TTSService):
         self._code_predictor = hf_model.talker.code_predictor
         self._speech_tokenizer = hf_model.speech_tokenizer
 
-        # torch.compile on Code Predictor's per-step model.
-        # We tried mode="reduce-overhead" (CUDA Graphs) but HF's DynamicCache
-        # mutates K/V tensors via torch.cat each step, which torch.compile
-        # detects as an in-place input mutation and either (a) silently falls
-        # back to no-cudagraphs or (b) gets stuck in a recompile loop trying
-        # to capture each cache state. max-autotune-no-cudagraphs is the safe
-        # sweet spot: kernel fusion + autotune wins without the graph capture
-        # complications. Closing the remaining ~45 ms CP-loop gap would need
-        # a custom static KV cache + manual torch.cuda.graph() capture (out
-        # of scope here).
+        # Pre-allocate StaticCache for the Code Predictor's 15-step loop.
+        # Max length is 17 (2 prefill rows + 15 generation steps). StaticCache
+        # uses indexed writes — required for the whole-function compile below
+        # to handle the kv cache without recompiling per cache shape.
+        from transformers import StaticCache as _StaticCache
+        self._cp_cache = _StaticCache(
+            config=self._code_predictor.config,
+            max_batch_size=1,
+            max_cache_len=CODEBOOKS_PER_FRAME + 1,  # 2 + 15
+            device=self._device,
+            dtype=self._dtype,
+        )
+
+        # Compile the ENTIRE 15-step decode loop (not just cp.model). This is
+        # the key win — inductor sees all 15 forwards + the loop control and
+        # fuses across them. Compiling only cp.model individually leaves the
+        # 15 launches as separate dispatcher calls, ~3 ms each = 45 ms of
+        # avoidable overhead. Whole-loop compile collapses this to ~15 ms.
         try:
-            self._code_predictor.model = torch.compile(
-                self._code_predictor.model,
+            self._cp_decode_15_compiled = torch.compile(
+                self._cp_decode_15_eager,
                 mode="max-autotune-no-cudagraphs",
                 dynamic=False,
                 fullgraph=False,
             )
-            logger.info("torch.compile(max-autotune-no-cudagraphs) applied to code_predictor.model")
+            logger.info("torch.compile applied to _cp_decode_15 (whole-loop)")
         except Exception as e:
-            logger.warning(f"torch.compile on code_predictor.model failed: {e}")
+            logger.warning(f"torch.compile on _cp_decode_15 failed: {e}")
+            self._cp_decode_15_compiled = self._cp_decode_15_eager
 
         # The vocoder (speech_tokenizer.model.decoder) is a causal ConvNet that
         # runs once per AR frame with stable single-frame input shape [1, 16, 1].
@@ -309,13 +318,13 @@ class MegakernelQwen3TTSService(TTSService):
 
     # -------------------------------------------------------- code-predictor
 
-    def _code_predictor_decode_15(self, cp_inputs: torch.Tensor) -> torch.Tensor:
+    def _cp_decode_15_eager(self, cp_inputs: torch.Tensor) -> torch.Tensor:
         """Hand-rolled greedy 15-step decode of the Code Predictor.
 
+        Uses a pre-allocated ``StaticCache`` (no in-place ``torch.cat``).
+        This function is compiled as a whole (via ``self._cp_decode_15_compiled``
+        in __init__) — inductor fuses across the 15 sequential forwards.
         Replaces ``self._code_predictor.generate(do_sample=False, max_new_tokens=15)``.
-        Saves the HF GenerationMixin per-step Python overhead; the inner
-        ``cp.model`` is torch.compile'd (max-autotune-no-cudagraphs) so the
-        per-step kernel cost is autotuned.
 
         Args:
             cp_inputs: ``[1, 2, H]`` bf16 — ``cat(past_talker_hidden, last_id_hidden)``.
@@ -326,33 +335,37 @@ class MegakernelQwen3TTSService(TTSService):
             ``last_id_hidden``).
         """
         cp = self._code_predictor
+        cache = self._cp_cache
+        cache.reset()
+
         # --- prefill on the 2-row input ---
         proj = cp.small_to_mtp_projection(cp_inputs)
+        cache_pos = torch.arange(2, device=self._device, dtype=torch.long)
         out = cp.model(
-            inputs_embeds=proj,
-            use_cache=True,
-            return_dict=True,
+            inputs_embeds=proj, past_key_values=cache, use_cache=True,
+            cache_position=cache_pos, return_dict=True,
         )
         logits = cp.lm_head[0](out.last_hidden_state[:, -1:, :])  # [1, 1, V]
         next_id = logits.argmax(dim=-1)  # [1, 1]
-        past_kv = out.past_key_values
 
         sub_codes = [next_id]
         # --- 14 more greedy steps, generation_steps = 1..14 ---
         for gen_step in range(1, CODEBOOKS_PER_FRAME - 1):
             emb_in = cp.model.get_input_embeddings()[gen_step - 1](next_id)
             proj = cp.small_to_mtp_projection(emb_in)
+            cache_pos = torch.tensor([1 + gen_step], device=self._device, dtype=torch.long)
             out = cp.model(
-                inputs_embeds=proj,
-                past_key_values=past_kv,
-                use_cache=True,
-                return_dict=True,
+                inputs_embeds=proj, past_key_values=cache, use_cache=True,
+                cache_position=cache_pos, return_dict=True,
             )
             logits = cp.lm_head[gen_step](out.last_hidden_state[:, -1:, :])
             next_id = logits.argmax(dim=-1)
-            past_kv = out.past_key_values
             sub_codes.append(next_id)
         return torch.cat(sub_codes, dim=-1)  # [1, 15]
+
+    def _code_predictor_decode_15(self, cp_inputs: torch.Tensor) -> torch.Tensor:
+        """Public entrypoint — routes through the compiled version."""
+        return self._cp_decode_15_compiled(cp_inputs)
 
     # -------------------------------------------------------- composite embed
 
