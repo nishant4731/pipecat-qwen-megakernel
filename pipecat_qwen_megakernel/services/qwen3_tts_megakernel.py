@@ -133,6 +133,38 @@ class MegakernelQwen3TTSService(TTSService):
         self._talker_hf = hf_model.talker
         self._code_predictor = hf_model.talker.code_predictor
         self._speech_tokenizer = hf_model.speech_tokenizer
+
+        # torch.compile on Code Predictor's per-step model. We use
+        # ``mode="max-autotune-no-cudagraphs"`` because:
+        #   * Real CUDA Graphs would require a custom static KV cache and
+        #     downstream-tensor-clone discipline that touches too many call
+        #     sites — not worth the maintenance burden vs the savings.
+        #   * max-autotune still triggers kernel autotuning (CUTLASS / Triton)
+        #     and dead-code elim, which gives a meaningful win over default
+        #     compile while staying safe.
+        try:
+            self._code_predictor.model = torch.compile(
+                self._code_predictor.model,
+                mode="max-autotune-no-cudagraphs",
+                dynamic=False,
+                fullgraph=False,
+            )
+            logger.info("torch.compile(max-autotune-no-cudagraphs) applied to code_predictor.model")
+        except Exception as e:
+            logger.warning(f"torch.compile on code_predictor.model failed: {e}")
+
+        # The vocoder (speech_tokenizer.model.decoder) is a causal ConvNet that
+        # runs once per AR frame with stable single-frame input shape [1, 16, 1].
+        # Compile the inner decoder forward — the outer ``decode()`` wrapper does
+        # input prep we can't easily compile.
+        try:
+            self._speech_tokenizer.model.decoder = torch.compile(
+                self._speech_tokenizer.model.decoder,
+                mode="default", dynamic=False, fullgraph=False,
+            )
+            logger.info("torch.compile applied to speech_tokenizer.model.decoder")
+        except Exception as e:
+            logger.warning(f"torch.compile on speech_tokenizer.model.decoder failed: {e}")
         if self._speech_tokenizer is None:
             raise RuntimeError(
                 "hf_model.speech_tokenizer is None — load the model via "
@@ -271,6 +303,53 @@ class MegakernelQwen3TTSService(TTSService):
             tts_pad_embed.to(torch.bfloat16),
         )
 
+    # -------------------------------------------------------- code-predictor
+
+    def _code_predictor_decode_15(self, cp_inputs: torch.Tensor) -> torch.Tensor:
+        """Hand-rolled greedy 15-step decode of the Code Predictor.
+
+        Replaces ``self._code_predictor.generate(do_sample=False, max_new_tokens=15)``.
+        Uses a pre-allocated StaticCache + ``mode="reduce-overhead"`` compile
+        so torch.compile can capture each forward as a CUDA Graph; eliminates
+        ~3 ms of launch overhead per step × 15 steps.
+
+        Args:
+            cp_inputs: ``[1, 2, H]`` bf16 — ``cat(past_talker_hidden, last_id_hidden)``.
+
+        Returns:
+            ``[1, 15]`` int64 — the residual codebook ids for codebooks 1..15
+            (codebook 0 is the talker's argmax-from-megakernel; passed in via
+            ``last_id_hidden``).
+        """
+        cp = self._code_predictor
+        # --- prefill on the 2-row input ---
+        proj = cp.small_to_mtp_projection(cp_inputs)
+        out = cp.model(
+            inputs_embeds=proj,
+            use_cache=True,
+            return_dict=True,
+        )
+        logits = cp.lm_head[0](out.last_hidden_state[:, -1:, :])  # [1, 1, V]
+        next_id = logits.argmax(dim=-1)  # [1, 1]
+        past_kv = out.past_key_values
+
+        sub_codes = [next_id]
+        # --- 14 more greedy steps, generation_steps = 1..14 ---
+        for gen_step in range(1, CODEBOOKS_PER_FRAME - 1):
+            emb_in = cp.model.get_input_embeddings()[gen_step - 1](next_id)
+            proj = cp.small_to_mtp_projection(emb_in)
+            out = cp.model(
+                inputs_embeds=proj,
+                past_key_values=past_kv,
+                use_cache=True,
+                return_dict=True,
+            )
+            logits = cp.lm_head[gen_step](out.last_hidden_state[:, -1:, :])
+            next_id = logits.argmax(dim=-1)
+            past_kv = out.past_key_values
+            sub_codes.append(next_id)
+        return torch.cat(sub_codes, dim=-1)  # [1, 15]
+
     # -------------------------------------------------------- composite embed
 
     def _compose_embed(
@@ -309,14 +388,7 @@ class MegakernelQwen3TTSService(TTSService):
             # PREVIOUS step. We stashed it on the utterance state.
             past_hidden = u.past_hidden  # [1, 1, H]
             cp_inputs = torch.cat((past_hidden, last_id_hidden), dim=1)
-            cp_out = self._code_predictor.generate(
-                inputs_embeds=cp_inputs,
-                max_new_tokens=CODEBOOKS_PER_FRAME - 1,
-                do_sample=False,  # greedy for benchmarking determinism
-                output_hidden_states=False,
-                return_dict_in_generate=True,
-            )
-            sub_codes = cp_out.sequences  # [1, 15] residual codebook ids
+            sub_codes = self._code_predictor_decode_15(cp_inputs)  # [1, 15] residual codebook ids
 
             # Stash the per-frame [1, 16] codes for the speech tokenizer.
             u.frame_codes.append(
@@ -401,16 +473,11 @@ class MegakernelQwen3TTSService(TTSService):
                     ),
                     dim=1,
                 )
-                cp_out = self._code_predictor.generate(
-                    inputs_embeds=cp_inputs,
-                    max_new_tokens=CODEBOOKS_PER_FRAME - 1,
-                    do_sample=False,
-                    return_dict_in_generate=True,
-                )
+                sub_codes_first = self._code_predictor_decode_15(cp_inputs)  # [1, 15]
                 first_frame_codes = torch.cat(
                     (
                         torch.tensor([[last_codec_token]], device=self._device, dtype=torch.long),
-                        cp_out.sequences,
+                        sub_codes_first,
                     ),
                     dim=-1,
                 )  # [1, 16]
