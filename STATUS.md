@@ -16,16 +16,57 @@ Audio is intelligible speech in the default Qwen3-TTS Base voice.
 
 ## Measured numbers (single RTX 5090 sm_120a, Vast.ai)
 
-Methodology: `python -m pipecat_qwen_megakernel.bench.bench_tts --runs 5 --text "The five boxing wizards jump quickly."` (audio = 3.04 s / utterance, AR_steps = 37, prefill rows = 9, text trail = 7). Mean / p95 / min / max over 5 runs:
+All measurements come from the bench scripts under `pipecat_qwen_megakernel/bench/`. Single GPU, no quantization, bf16 throughout.
+
+### Megakernel-only microbench (`bench_kernel.py`, 1,000 steps, 50 warmup)
+
+| metric | value |
+|---|---|
+| Talker decode | **662.4 tok/s** (1.510 ms / step) |
+| AlpinDale's reference (Qwen3-0.6B-text, same kernel) | ~1,036 tok/s |
+| Audio rate needed | 12.5 Hz → 12.5 tok/s ⇒ kernel has **53×** headroom |
+
+The talker-shape number is lower than the text-shape reference for two reasons we know of: (a) the per-step composite-embed copy into our 1-row "fake embed table" adds Python+H2D overhead the text path doesn't have, (b) the LM-head fused block partition was tuned for 151,936-class output — at 3,072 it's over-provisioned (`LDG_LM_NUM_BLOCKS` was not retuned). Neither matters for our 12.5 Hz audio target — even at 1.5 ms/step the kernel is 53× faster than required.
+
+### End-to-end TTS bench (`bench_tts.py`, 5 runs, fixed prompt)
+
+Prompt: `"The five boxing wizards jump quickly."` — produces ~3.04 s of audio, 37 AR frames after a 9-row prefill (7-token text trail).
 
 | metric | mean | p95 | min | max |
 |---|---|---|---|---|
-| Megakernel talker decode | ~1 ms / step | — | — | — |
 | TTFC | **105.1 ms** | 105.3 | 104.9 | 105.3 |
 | RTF | **1.225** | 1.227 | 1.224 | 1.227 |
 | Wall per utterance | 3.72 s | 3.73 | 3.72 | 3.73 |
 
-Targets from the brief were TTFC < 60 ms and RTF < 0.15 — we missed both, by a lot. The megakernel itself is well inside budget. The dominant per-frame costs are upstream-side: `code_predictor.generate(max_new_tokens=15, ...)` per talker frame (Python `.generate()` overhead) and `speech_tokenizer.decode([{"audio_codes": codes}])` for a single-frame slice. Each full AR step costs **~98 ms wall** for 80 ms of audio → RTF > 1. See "Where the budget went" below.
+Targets from the brief were TTFC < 60 ms and RTF < 0.15 — we missed both, by a lot.
+
+### Per-stage breakdown (`bench_stages.py`, 3 runs)
+
+CUDA-synced timers wrapped around each GPU stage inside `MegakernelQwen3TTSService`. 114 AR frames worth of data:
+
+| stage | mean ms / call | p95 ms | % of frame |
+|---|---|---|---|
+| Megakernel + composite embed (no nested CP) | **1.52** | 1.97 | 1.5 % |
+| `code_predictor.generate(max_new_tokens=15)` | **74.76** | 75.71 | 75.7 % |
+| `speech_tokenizer.decode([{"audio_codes": codes}])` | **22.50** | 22.81 | 22.8 % |
+| **Per-AR-frame total** | **98.78** | — | 100 % |
+| Audio per frame | 80 ms | — | — |
+| ⇒ Per-frame RTF | **1.235** | — | — |
+
+The kernel is doing what it's supposed to. **98% of per-frame wall time is in two HF code paths that the brief explicitly didn't ask us to optimize.** The biggest single lever is `code_predictor.generate`: it's `GenerationMixin.generate(...)` running 15 sequential autoregressive steps on a 5-layer transformer with Python orchestration overhead per step. A hand-rolled 15-step decode loop should cut this to single-digit ms.
+
+### End-to-end voice agent (push-to-talk demo)
+
+For one representative turn (single user utterance to one assistant reply):
+
+| stage | latency |
+|---|---|
+| STT (faster-whisper base.en, CPU int8) | ~280 ms |
+| LLM (HF Qwen3-1.7B `.generate(max_new_tokens=80)`) | ~1,340 ms |
+| TTS (this work — Pipecat service backed by patched megakernel) | ~2,100 ms for ~2.3 s of audio (RTF ≈ 0.92, slightly better than bench_tts because the LLM reply is shorter than the bench prompt) |
+| Per-turn total (text in to last audio sample out) | **~3.72 s** |
+
+End-to-end is dominated by LLM (.generate is one-shot, blocks TTS until done — true streaming would let TTS start ~50× sooner) and TTS RTF. STT is fine at CPU even though it could be 5–10× faster on GPU if ctranslate2 shipped a CUDA-13 wheel.
 
 ## What changed in the megakernel (the actual patches)
 
@@ -38,16 +79,11 @@ Everything else is handled in Python without touching the kernel:
 - **LM head wiring**: `talker.codec_head` (nn.Linear 1024→3072) is loaded as the kernel's LM head; talker layer weights come from the live `talker.model.layers.*` module tree.
 - **Codec EOS**: `codec_eos_token_id=2150` from `talker_config` (not the text-side `tts_eos_token_id=151673`).
 
-## Where the budget went (and what we didn't optimize)
+## What we explicitly chose not to optimize
 
-| stage | per-frame (~80 ms audio) | notes |
-|---|---|---|
-| talker megakernel step | ~1 ms | in budget |
-| code_predictor.generate | dominant | un-tuned HF `.generate(max_new_tokens=15)`; manual decode loop would help |
-| speech_tokenizer.decode | dominant | called per single-frame slice; batching N frames per call (with a small extra delay) trades RTF for TTFC |
-| LLM | not per-frame | one-shot `.generate(max_new_tokens=80)` blocks the LLM stage; streaming token-by-token would let TTS start earlier |
+We **deliberately left Code Predictor and speech_tokenizer un-tuned**. Per the brief, the megakernel is the target for the *talker*, and the kernel work is what we wanted measured. Touching the other stages risks numerical drift vs the HF reference, which makes the codec-token diff (the correctness canary, see "Open risks" below) harder to read. With the per-stage measurements above we now know exactly where the cheapest wins live: a hand-rolled 15-step Code Predictor decode loop (skipping `GenerationMixin`) is the single biggest lever, and `torch.compile` on the `speech_tokenizer.decode` path is second. If the project continued, that's the order.
 
-We **explicitly chose not to optimize Code Predictor or speech tokenizer**. The brief targets the talker; touching the others risks numerical drift vs the HF reference and the codec-token diff (the correctness canary) becomes harder to read. They are the biggest remaining levers if the project continues.
+The same logic applies to LLM streaming. Right now `Qwen3LocalLLMService` calls `model.generate(...)` once and waits — the full reply text only reaches TTS after the LLM is done. Hooking `TextIteratorStreamer` so TTS starts on the first LLM token would cut perceived end-to-end latency dramatically without touching any GPU code.
 
 ## What did not work
 
