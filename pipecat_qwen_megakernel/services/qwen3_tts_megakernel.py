@@ -134,14 +134,16 @@ class MegakernelQwen3TTSService(TTSService):
         self._code_predictor = hf_model.talker.code_predictor
         self._speech_tokenizer = hf_model.speech_tokenizer
 
-        # torch.compile on Code Predictor's per-step model. We use
-        # ``mode="max-autotune-no-cudagraphs"`` because:
-        #   * Real CUDA Graphs would require a custom static KV cache and
-        #     downstream-tensor-clone discipline that touches too many call
-        #     sites — not worth the maintenance burden vs the savings.
-        #   * max-autotune still triggers kernel autotuning (CUTLASS / Triton)
-        #     and dead-code elim, which gives a meaningful win over default
-        #     compile while staying safe.
+        # torch.compile on Code Predictor's per-step model.
+        # We tried mode="reduce-overhead" (CUDA Graphs) but HF's DynamicCache
+        # mutates K/V tensors via torch.cat each step, which torch.compile
+        # detects as an in-place input mutation and either (a) silently falls
+        # back to no-cudagraphs or (b) gets stuck in a recompile loop trying
+        # to capture each cache state. max-autotune-no-cudagraphs is the safe
+        # sweet spot: kernel fusion + autotune wins without the graph capture
+        # complications. Closing the remaining ~45 ms CP-loop gap would need
+        # a custom static KV cache + manual torch.cuda.graph() capture (out
+        # of scope here).
         try:
             self._code_predictor.model = torch.compile(
                 self._code_predictor.model,
@@ -311,9 +313,9 @@ class MegakernelQwen3TTSService(TTSService):
         """Hand-rolled greedy 15-step decode of the Code Predictor.
 
         Replaces ``self._code_predictor.generate(do_sample=False, max_new_tokens=15)``.
-        Uses a pre-allocated StaticCache + ``mode="reduce-overhead"`` compile
-        so torch.compile can capture each forward as a CUDA Graph; eliminates
-        ~3 ms of launch overhead per step × 15 steps.
+        Saves the HF GenerationMixin per-step Python overhead; the inner
+        ``cp.model`` is torch.compile'd (max-autotune-no-cudagraphs) so the
+        per-step kernel cost is autotuned.
 
         Args:
             cp_inputs: ``[1, 2, H]`` bf16 — ``cat(past_talker_hidden, last_id_hidden)``.
