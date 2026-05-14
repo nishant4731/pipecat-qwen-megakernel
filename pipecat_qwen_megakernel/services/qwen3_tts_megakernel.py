@@ -178,6 +178,20 @@ class MegakernelQwen3TTSService(TTSService):
             logger.info("torch.compile(reduce-overhead) applied to speech_tokenizer.model.decoder")
         except Exception as e:
             logger.warning(f"torch.compile on speech_tokenizer.model.decoder failed: {e}")
+
+        # Pre-stack the 15 Code Predictor residual-codebook embedding weights
+        # into a single tensor of shape [15, 2048, H]. Lets us replace the
+        # per-codebook ``cp.get_input_embeddings()[i](sub_codes[..., i:i+1])``
+        # loop (15 separate small kernel launches) with one fused gather.
+        cp_embs = list(self._code_predictor.get_input_embeddings())
+        assert len(cp_embs) == CODEBOOKS_PER_FRAME - 1, (
+            f"expected {CODEBOOKS_PER_FRAME - 1} CP embeddings, got {len(cp_embs)}"
+        )
+        self._cp_emb_stack = torch.stack([e.weight for e in cp_embs], dim=0).contiguous()
+        # [15, 2048, H]
+        self._cp_emb_idx = torch.arange(
+            CODEBOOKS_PER_FRAME - 1, device=self._device, dtype=torch.long,
+        )  # [15]
         if self._speech_tokenizer is None:
             raise RuntimeError(
                 "hf_model.speech_tokenizer is None — load the model via "
@@ -417,12 +431,15 @@ class MegakernelQwen3TTSService(TTSService):
 
             # 3) Compose embedding:
             #      sum over i of codebook_i_emb + (trailing_text or tts_pad).
-            codec_hiddens = [last_id_hidden]
-            for i in range(CODEBOOKS_PER_FRAME - 1):
-                emb_i = self._code_predictor.get_input_embeddings()[i](sub_codes[..., i:i+1])
-                codec_hiddens.append(emb_i)
-            codec_hiddens_cat = torch.cat(codec_hiddens, dim=1)
-            inputs_embeds = codec_hiddens_cat.sum(1, keepdim=True)  # [1, 1, H]
+            # Fused: one fancy-indexing gather instead of 15 separate
+            # per-codebook embedding lookups. self._cp_emb_stack is
+            # [15, 2048, H]; sub_codes is [1, 15]. Indexing
+            # self._cp_emb_stack[self._cp_emb_idx, sub_codes[0]] yields
+            # [15, H] — the embedding for each codebook position.
+            cp_embs_15 = self._cp_emb_stack[self._cp_emb_idx, sub_codes[0]]  # [15, H]
+            inputs_embeds = (
+                last_id_hidden + cp_embs_15.sum(0, keepdim=True).unsqueeze(0)
+            )  # [1, 1, H]
 
             # frame_idx is 0-indexed for the autoregressive part. trailing_text_hidden
             # has length T_text — index frame_idx if in range, else use pad.
